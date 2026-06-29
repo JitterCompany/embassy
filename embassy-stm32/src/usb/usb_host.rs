@@ -785,7 +785,13 @@ impl<'d, I: SealedHostInstance> UsbHostAllocator<'d> for Allocator<'d, I> {
         let mut epr = invariant(epr_reg.read());
         epr.set_devaddr(addr);
         epr.set_ep_type(convert_type(endpoint.ep_type));
-        epr.set_ea(new_index as _);
+        // EA is the device endpoint number, which is independent of the host
+        // channel register slot (`new_index`) this pipe was allocated. They
+        // happen to coincide for a single directly-attached device (its only
+        // interrupt endpoint, EP1, lands in slot 1), but not in general — e.g.
+        // a device's EP1 behind a hub may be allocated to slot 2, and was then
+        // polled as endpoint 2 and never responded.
+        epr.set_ea(endpoint.addr.index() as _);
         epr_reg.write_value(epr);
 
         Ok(channel)
