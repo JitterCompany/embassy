@@ -396,6 +396,9 @@ pub struct Channel<'d, I: SealedHostInstance, D: pipe::Direction, T: pipe::Type>
     _marker: PhantomData<(&'d mut I, D, T)>,
     /// Register index (there are 8 in total)
     index: usize,
+    /// Device address this pipe targets. Stored so the control channel can be
+    /// re-addressed before each transfer (see `restore_control_channel`).
+    addr: u8,
     max_packet_size_in: u16,
     #[allow(dead_code)]
     max_packet_size_out: u16,
@@ -406,6 +409,7 @@ pub struct Channel<'d, I: SealedHostInstance, D: pipe::Direction, T: pipe::Type>
 impl<'d, I: SealedHostInstance, D: pipe::Direction, T: pipe::Type> Channel<'d, I, D, T> {
     fn new(
         index: usize,
+        addr: u8,
         buf_in: Option<EndpointBuffer<I>>,
         buf_out: Option<EndpointBuffer<I>>,
         max_packet_size_in: u16,
@@ -414,10 +418,35 @@ impl<'d, I: SealedHostInstance, D: pipe::Direction, T: pipe::Type> Channel<'d, I
         Self {
             _marker: PhantomData,
             index,
+            addr,
             max_packet_size_in,
             max_packet_size_out,
             buf_in,
             buf_out,
+        }
+    }
+
+    /// Re-assert this control pipe's device address and receive buffer
+    /// descriptor on the shared control channel.
+    ///
+    /// The control channel (register slot 0) is reused by *every* control pipe,
+    /// but its device address and BTABLE receive-buffer descriptor are written
+    /// only when the pipe is allocated. Allocating a second device's control
+    /// pipe therefore re-points slot 0 at that device and its buffer, so an
+    /// earlier control pipe would otherwise address the wrong device and
+    /// receive into the wrong buffer. Restoring both from this pipe's own state
+    /// before each transfer keeps concurrently-open control pipes (e.g. a hub
+    /// and the devices behind it) independent. The transmit descriptor is
+    /// rewritten per packet in `write_data`, so it needs no restore.
+    fn restore_control_channel(&self) {
+        let epr_reg = self.reg();
+        let mut epr = invariant(epr_reg.read());
+        epr.set_devaddr(self.addr);
+        epr_reg.write_value(epr);
+
+        if let Some(buf_in) = self.buf_in.as_ref() {
+            let (_, len_bits) = calc_receive_len_bits(self.max_packet_size_in);
+            btable::write_receive_buffer_descriptor::<I>(self.index, buf_in.addr, len_bits);
         }
     }
 
@@ -595,6 +624,9 @@ impl<'d, I: SealedHostInstance, T: pipe::Type, D: pipe::Direction> UsbPipe<T, D>
         T: pipe::IsControl,
         D: pipe::IsIn,
     {
+        // Slot 0 is shared by all control pipes; re-point it at this device.
+        self.restore_control_channel();
+
         let epr0 = I::regs().epr(0);
 
         // setup stage
@@ -621,6 +653,9 @@ impl<'d, I: SealedHostInstance, T: pipe::Type, D: pipe::Direction> UsbPipe<T, D>
         T: pipe::IsControl,
         D: pipe::IsOut,
     {
+        // Slot 0 is shared by all control pipes; re-point it at this device.
+        self.restore_control_channel();
+
         let epr0 = I::regs().epr(0);
 
         // setup stage
@@ -774,6 +809,7 @@ impl<'d, I: SealedHostInstance> UsbHostAllocator<'d> for Allocator<'d, I> {
 
         let channel = Channel::<I, D, T>::new(
             new_index as usize,
+            addr,
             buffer_in,
             buffer_out,
             endpoint.max_packet_size,
