@@ -150,6 +150,12 @@ fn align_len_up(len: u16) -> u16 {
 /// `actual_len` length in bytes rounded up to USBRAM_ALIGN
 /// `len_bits` should be placed on the upper 16 bits of the register value
 fn calc_receive_len_bits(len: u16) -> (u16, u16) {
+    // A wMaxPacketSize of 0 or 1 is legal — e.g. a USB hub's status-change
+    // interrupt endpoint reports 1. The small-block buffer descriptor encoding
+    // cannot represent fewer than 2 bytes, so allocate at least one 2-byte
+    // block. The hardware writes the real transfer length into the COUNT field,
+    // which `read_data` honors, so the slightly oversized buffer is harmless.
+    let len = len.max(2);
     match len {
         // NOTE: this could be 2..=62 with 16bit USBRAM, but not with 32bit. Limit it to 60 for simplicity.
         2..=60 => (align_len_up(len), align_len_up(len) / 2 << 10),
