@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 use core::future::poll_fn;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::Poll;
 
 use embassy_sync::waitqueue::AtomicWaker;
@@ -77,6 +77,7 @@ impl<I: Instance> interrupt::typelevel::Handler<I::Interrupt> for USBHostInterru
             regs.epr(index).write_value(epr_value);
 
             if rx_ready {
+                RX_COMPLETE[index].store(true, Ordering::Relaxed);
                 EP_IN_WAKERS[index].wake();
             }
             if tx_ready {
@@ -130,6 +131,14 @@ const NEW_AW: AtomicWaker = AtomicWaker::new();
 static BUS_WAKER: AtomicWaker = NEW_AW;
 static EP_IN_WAKERS: [AtomicWaker; EP_COUNT] = [NEW_AW; EP_COUNT];
 static EP_OUT_WAKERS: [AtomicWaker; EP_COUNT] = [NEW_AW; EP_COUNT];
+/// Set by the interrupt handler when a reception completes (CTR_RX), consumed
+/// by [`Channel::read`]. `STAT_RX == Disabled` alone is ambiguous: it means
+/// either "packet received, data pending in the endpoint buffer" or "disabled
+/// by error recovery / never armed". This flag disambiguates, which lets
+/// `read` resume a reception armed by a previously cancelled `read` future
+/// instead of re-arming and discarding an already-ACKed packet.
+const NEW_FLAG: AtomicBool = AtomicBool::new(false);
+static RX_COMPLETE: [AtomicBool; EP_COUNT] = [NEW_FLAG; EP_COUNT];
 
 fn convert_type(t: EndpointType) -> EpType {
     match t {
@@ -558,7 +567,18 @@ impl<'d, I: SealedHostInstance, D: pipe::Direction, T: pipe::Type> Channel<'d, I
 
         let timeout_ms = 1000;
 
-        self.activate_rx();
+        // Arm reception only when the channel is not already armed and no
+        // completed-but-unread packet is pending. Dropping a `read` future
+        // does not disarm the hardware: the packet can still arrive (and be
+        // ACKed on the bus) while no future is polling, so unconditionally
+        // re-arming here would silently discard it.
+        let stat = self.reg().read().stat_rx();
+        let armed_or_pending = matches!(stat, Stat::Valid)
+            || (matches!(stat, Stat::Disabled) && RX_COMPLETE[index].load(Ordering::Relaxed));
+        if !armed_or_pending {
+            RX_COMPLETE[index].store(false, Ordering::Relaxed);
+            self.activate_rx();
+        }
 
         let regs = I::regs();
 
@@ -584,6 +604,14 @@ impl<'d, I: SealedHostInstance, D: pipe::Direction, T: pipe::Type> Channel<'d, I
             let stat = self.reg().read().stat_rx();
             match stat {
                 Stat::Disabled => {
+                    if !RX_COMPLETE[index].load(Ordering::Relaxed) {
+                        // Disarmed without a completed reception (e.g. error
+                        // recovery in the interrupt handler): the buffer holds
+                        // no new data, so re-arm instead of reading stale bytes.
+                        self.activate_rx();
+                        return Poll::Pending;
+                    }
+                    RX_COMPLETE[index].store(false, Ordering::Relaxed);
                     // Data available for read
                     let idest = &mut buf[count..];
                     let n = self.read_data(idest)?;
@@ -622,6 +650,12 @@ impl<'d, I: SealedHostInstance, T: pipe::Type, D: pipe::Direction> UsbPipe<T, D>
         // Slot 0 is shared by all control pipes; re-point it at this device.
         self.restore_control_channel();
 
+        // A cancelled earlier transfer may have left slot 0 armed or holding
+        // an unread packet; SETUP starts a fresh transaction, so disarm and
+        // discard.
+        self.disable_rx();
+        RX_COMPLETE[self.index].store(false, Ordering::Relaxed);
+
         let epr0 = I::regs().epr(0);
 
         // setup stage
@@ -650,6 +684,12 @@ impl<'d, I: SealedHostInstance, T: pipe::Type, D: pipe::Direction> UsbPipe<T, D>
     {
         // Slot 0 is shared by all control pipes; re-point it at this device.
         self.restore_control_channel();
+
+        // A cancelled earlier transfer may have left slot 0 armed or holding
+        // an unread packet; SETUP starts a fresh transaction, so disarm and
+        // discard.
+        self.disable_rx();
+        RX_COMPLETE[self.index].store(false, Ordering::Relaxed);
 
         let epr0 = I::regs().epr(0);
 
@@ -710,6 +750,16 @@ impl<'d, I: SealedHostInstance, T: pipe::Type, D: pipe::Direction> UsbPipe<T, D>
 
 impl<'d, I: SealedHostInstance, T: pipe::Type, D: pipe::Direction> Drop for Channel<'d, I, D, T> {
     fn drop(&mut self) {
+        if self.index != 0 {
+            // Disarm so the hardware can't receive into (or transmit from)
+            // the freed buffer, and drop any pending completion so a future
+            // channel reusing this slot doesn't read stale data. Slot 0 is
+            // shared by all control pipes and is cleaned up at the start of
+            // each control transfer instead.
+            self.disable_rx();
+            self.disable_tx();
+            RX_COMPLETE[self.index].store(false, Ordering::Relaxed);
+        }
         let state = I::host_state();
         critical_section::with(|_| {
             let pipes = &state.allocated_pipes;
